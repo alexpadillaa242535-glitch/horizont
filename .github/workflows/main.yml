@@ -1,0 +1,25 @@
+name: Build Horizon Windows
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Configurar Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Compilar Cliente en Release
+      run: cargo build --release
+
+    - name: Subir Binarios Compilados
+      uses: actions/upload-artifact@v4
+      with:
+        name: horizon-binaries-windows
+        path: target/release/
