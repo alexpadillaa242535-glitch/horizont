@@ -363,4 +363,270 @@ impl ChatKeyPair {
 pub fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(
+        .map_or(0, |d| d.as_millis() as i64)
+}
+
+/// Instant.parse for the services' UTC times
+/// (`2022-07-30T23:05:24.548227Z`): epoch milliseconds.
+pub fn parse_instant(text: &str) -> Option<i64> {
+    let text = text.strip_suffix('Z')?;
+    let (date, time) = text.split_once('T')?;
+    let mut date = date.splitn(3, '-').map(|p| p.parse::<i64>().ok());
+    let (y, m, d) = (date.next()??, date.next()??, date.next()??);
+    let (hms, fraction) = time.split_once('.').unwrap_or((time, ""));
+    let mut hms = hms.splitn(3, ':').map(|p| p.parse::<i64>().ok());
+    let (h, min, s) = (hms.next()??, hms.next()??, hms.next()??);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || h > 23 || min > 59 || s > 60 {
+        return None;
+    }
+    if !fraction.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let millis = format!("{fraction:0<3}")[..3].parse::<i64>().ok()?;
+    // Days from 1970-01-01 (Howard Hinnant's days_from_civil).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(((days * 24 + h) * 60 + min) * 60_000 + s * 1000 + millis)
+}
+
+/// Crypt.stringToPemRsaPrivateKey / stringToRsaPublicKey: the base64
+/// between a PEM block's armour lines.
+fn pem_der(pem: &str) -> Option<Vec<u8>> {
+    let body: String = pem
+        .lines()
+        .filter(|l| !l.starts_with("-----"))
+        .flat_map(|l| l.chars().filter(|c| !c.is_whitespace()))
+        .collect();
+    crate::skins::base64_decode(&body)
+}
+
+/// KeyPairResponse from the certificates endpoint, as
+/// AccountProfileKeyPairManager.fetchProfileKeyPair reads it: the PEM key
+/// pair, publicKeySignatureV2 (the signature over the profile id too),
+/// expiresAt and refreshedAfter. None for anything malformed, or a private
+/// key that isn't the public key's other half.
+pub fn parse_certificates(body: &str) -> Option<ChatKeyPair> {
+    use horizon_protocol::rsa::{RsaPrivateKey, RsaPublicKey};
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let field = |path: &str| v.pointer(path).and_then(|s| s.as_str());
+    let private = RsaPrivateKey::from_der(&pem_der(field("/keyPair/privateKey")?)?).ok()?;
+    let key = pem_der(field("/keyPair/publicKey")?)?;
+    if RsaPublicKey::from_der(&key).ok()? != private.public {
+        return None;
+    }
+    let signature = crate::skins::base64_decode(field("/publicKeySignatureV2")?)?;
+    Some(ChatKeyPair {
+        private,
+        public: horizon_protocol::secure_chat::ProfileKey {
+            expires_at: parse_instant(field("/expiresAt")?)?,
+            key,
+            signature,
+        },
+        refreshed_after: parse_instant(field("/refreshedAfter")?)?,
+    })
+}
+
+/// UserApiService.getKeyPair: the certificates endpoint, POSTed with the
+/// access token.
+pub fn fetch_chat_keys(session: &AuthSession) -> Result<ChatKeyPair, JoinError> {
+    let doc = discovery()?;
+    let url = endpoint(&doc, "player", "getCertificates").ok_or(JoinError::Unavailable)?;
+    let body = match agent()
+        .post(&url)
+        .set("Authorization", &format!("Bearer {}", session.access_token))
+        .set("Content-Type", "application/json; charset=utf-8")
+        .send_string("")
+    {
+        Ok(response) => response.into_string().unwrap_or_default(),
+        Err(ureq::Error::Status(status, response)) => {
+            return Err(JoinError::from_response(
+                status,
+                &response.into_string().unwrap_or_default(),
+            ));
+        }
+        Err(ureq::Error::Transport(_)) => return Err(JoinError::Unavailable),
+    };
+    parse_certificates(&body)
+        .ok_or_else(|| JoinError::Other("Malformed profile key pair response".to_owned()))
+}
+
+/// AccountProfileKeyPairManager.MINIMUM_PROFILE_KEY_REFRESH_INTERVAL.
+const KEY_RETRY: Duration = Duration::from_secs(60 * 60);
+
+/// The chat key pair as AccountProfileKeyPairManager keeps it: fetched on a
+/// background thread, kept until it is due a refresh, and on a failure kept
+/// as it was (the next try waits an hour, or the next join).
+#[derive(Default)]
+struct ChatKeys {
+    current: Option<Arc<ChatKeyPair>>,
+    fetching: bool,
+    next_try: Option<std::time::Instant>,
+}
+static CHAT_KEYS: std::sync::LazyLock<Mutex<std::collections::HashMap<u128, ChatKeys>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// prepareKeyPair (`now`: on a join) or, from a tick, shouldRefreshKeyPair
+/// then prepareKeyPair: start fetching when there is no key pair or it is
+/// due a refresh. Nothing without a signed-in account.
+pub fn prepare_chat_keys(now: bool) {
+    let Some(session) = current() else {
+        return;
+    };
+    prepare_chat_keys_for(session, now);
+}
+
+/// Prepare keys for this player, independently of the other local accounts.
+pub fn prepare_chat_keys_for(session: Arc<AuthSession>, now: bool) {
+    let uuid = session.uuid;
+    let mut accounts = CHAT_KEYS.lock().unwrap();
+    let keys = accounts.entry(uuid).or_default();
+    let instant = std::time::Instant::now();
+    if keys.fetching || !now && keys.next_try.is_some_and(|t| instant < t) {
+        return;
+    }
+    keys.next_try = Some(instant + KEY_RETRY);
+    if keys
+        .current
+        .as_ref()
+        .is_some_and(|k| !k.due_refresh(now_millis()))
+    {
+        return;
+    }
+    keys.fetching = true;
+    drop(accounts);
+    let spawned = std::thread::Builder::new()
+        .name("Profile key fetch".into())
+        .spawn(move || {
+            let result = fetch_chat_keys(&session);
+            let mut accounts = CHAT_KEYS.lock().unwrap();
+            let keys = accounts.entry(uuid).or_default();
+            keys.fetching = false;
+            match result {
+                Ok(pair) => keys.current = Some(Arc::new(pair)),
+                Err(e) => log::error!("Failed to retrieve profile key pair: {e:?}"),
+            }
+        });
+    if spawned.is_err() {
+        CHAT_KEYS.lock().unwrap().entry(uuid).or_default().fetching = false;
+    }
+}
+
+/// The chat key pair fetched so far, unless it has expired.
+pub fn chat_keys() -> Option<Arc<ChatKeyPair>> {
+    chat_keys_for(current()?.uuid)
+}
+
+/// This account's key pair; another local player's keys can never be returned.
+pub fn chat_keys_for(uuid: u128) -> Option<Arc<ChatKeyPair>> {
+    CHAT_KEYS
+        .lock()
+        .unwrap()
+        .get(&uuid)?
+        .current
+        .clone()
+        .filter(|k| !k.public.has_expired(now_millis()))
+}
+
+const MINECRAFT_PROFILE: &str = "https://api.minecraftservices.com/minecraft/profile";
+
+/// The signed-in account's active skin and cape from `GET /minecraft/profile`.
+/// Single-player and integrated servers often send no `textures` property, or
+/// one without the equipped cape; the client asks the profile endpoint once.
+pub fn own_textures(session: &AuthSession) -> Option<crate::skins::Textures> {
+    let response = agent()
+        .get(MINECRAFT_PROFILE)
+        .set("Authorization", &format!("Bearer {}", session.access_token))
+        .call()
+        .ok()?;
+    if response.status() != 200 {
+        return None;
+    }
+    let body = response.into_string().ok()?;
+    let profile: serde_json::Value = serde_json::from_str(&body).ok()?;
+    Some(crate::skins::services_profile_textures(&profile))
+}
+
+/// What the session service says about a player joining this server
+/// (MinecraftServicesSessionService.hasJoinedServer).
+#[derive(Clone, Debug, PartialEq)]
+pub struct JoinedProfile {
+    pub uuid: u128,
+    pub properties: Vec<horizon_protocol::packets::login::Property>,
+}
+
+/// HttpDiscoveryService.buildQuery: `URLEncoder.encode(value, UTF-8)`.
+fn url_encode(text: &str) -> String {
+    let mut out = String::new();
+    for b in text.bytes() {
+        match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'-' | b'*' | b'_' => {
+                out.push(char::from(b));
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// The session service's verify endpoint, asked by an online-mode server
+/// whether `name` joined with `server_hash` (and from `ip`, when the server
+/// prevents proxy connections). `Ok(None)`: it didn't, or the service said
+/// no; `Err(Unavailable)`: no answer.
+pub fn has_joined(
+    name: &str,
+    server_hash: &str,
+    ip: Option<std::net::IpAddr>,
+) -> Result<Option<JoinedProfile>, JoinError> {
+    let doc = discovery()?;
+    let url = endpoint(&doc, "session", "verify").ok_or(JoinError::Unavailable)?;
+    let mut query = format!(
+        "username={}&serverId={}",
+        url_encode(name),
+        url_encode(server_hash)
+    );
+    if let Some(ip) = ip {
+        query.push_str(&format!("&ip={}", url_encode(&ip.to_string())));
+    }
+    let separator = if url.contains('?') { '&' } else { '?' };
+    let body = match agent().get(&format!("{url}{separator}{query}")).call() {
+        Ok(response) => response.into_string().unwrap_or_default(),
+        Err(ureq::Error::Status(status, response)) => {
+            let error =
+                JoinError::from_response(status, &response.into_string().unwrap_or_default());
+            return match error {
+                JoinError::Unavailable => Err(error),
+                _ => Ok(None),
+            };
+        }
+        Err(ureq::Error::Transport(_)) => return Err(JoinError::Unavailable),
+    };
+    Ok(parse_joined(&body))
+}
+
+/// HasJoinedMinecraftServerResponse: `id` and `properties`; no id is no profile.
+pub fn parse_joined(body: &str) -> Option<JoinedProfile> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let uuid = parse_uuid(v.get("id")?.as_str()?)?;
+    let properties = v
+        .get("properties")
+        .and_then(|p| p.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|p| {
+            Some(horizon_protocol::packets::login::Property {
+                name: p.get("name")?.as_str()?.to_owned(),
+                value: p.get("value")?.as_str()?.to_owned(),
+                signature: p
+                    .get("signature")
+                    .and_then(|s| s.as_str())
+                    .map(str::to_owned),
+            })
+        })
+        .collect();
+    Some(JoinedProfile { uuid, properties })
+}
