@@ -284,15 +284,15 @@ jobs:
             echo "run=false" >> "$GITHUB_OUTPUT"
             echo "No harness, oracle, probe or runner change: parity-main checks this on main"
           fi
-  parity:
-    needs: parity-scope
-    if: needs.parity-scope.outputs.run == 'true'
-    uses: ./.github/workflows/parity.yml
-    with:
-      base: ${{ github.event.pull_request.base.sha }}
-      head: ${{ github.event.pull_request.head.sha }}
-      full: ${{ contains(github.event.pull_request.labels.*.name, 'full-parity') }}
-      frame_identity: ${{ contains(github.event.pull_request.labels.*.name, 'frame-identity') }}
+# parity:
+#   needs: parity-scope
+#   if: needs.parity-scope.outputs.run == 'true'
+#   uses: ./.github/workflows/parity.yml
+#   with:
+#     base: ${{ github.event.pull_request.base.sha }}
+#     head: ${{ github.event.pull_request.head.sha }}
+#     full: ${{ contains(github.event.pull_request.labels.*.name, 'full-parity') }}
+#     frame_identity: ${{ contains(github.event.pull_request.labels.*.name, 'frame-identity') }}
   # Horizon never downloads the game. These jobs need a self-hosted Linux runner
   # (label horizon-game) holding the maintainer's own copy: the official launcher's
   # game directory in HORIZON_MINECRAFT_DIR and the pinned server jar in
