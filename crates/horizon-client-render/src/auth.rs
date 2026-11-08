@@ -363,5 +363,4 @@ impl ChatKeyPair {
 pub fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as i64)
-}
+        .map_or(
