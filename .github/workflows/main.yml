@@ -15,8 +15,8 @@ jobs:
     - name: Configurar Rust
       uses: dtolnay/rust-toolchain@stable
 
-    - name: Compilar Cliente
-      run: cargo build --release --bin horizon-client
+    - name: Compilar Paquete del Cliente
+      run: cargo build --release -p horizon-client
 
     - name: Subir Binarios Compilados
       uses: actions/upload-artifact@v4
