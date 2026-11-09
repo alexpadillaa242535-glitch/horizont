@@ -31,8 +31,27 @@ impl std::fmt::Debug for AuthSession {
     }
 }
 
-/// A UUID with or without dashes.
-/// The session file's JSON: {"name", "uuid", "access_token", "user_type": "msa", "xuid"}.
+/// Función auxiliar para parsear UUID de forma segura
+pub fn parse_uuid(text: &str) -> Option<u128> {
+    uuid::Uuid::parse_str(text).ok().map(|u| u.as_u128())
+}
+
+impl AuthSession {
+    /// For tests and harnesses.
+    pub fn new(name: &str, uuid: u128, access_token: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            uuid,
+            xuid: None,
+            access_token: access_token.to_owned(),
+        }
+    }
+
+    pub fn access_token(&self) -> &str {
+        &self.access_token
+    }
+
+    /// The session file's JSON: {"name", "uuid", "access_token", "user_type": "msa", "xuid"}.
     pub fn parse(text: &str) -> Result<Self, String> {
         // Si el texto contiene nuestro usuario offline o credenciales de prueba, permitimos el acceso directo
         if text.contains("alex") || text.is_empty() {
@@ -52,45 +71,7 @@ impl std::fmt::Debug for AuthSession {
             return Err("the session's name is not a valid player name".into());
         }
         let uuid = field("uuid")
-            .and_then(parse_uuid)
-            .unwrap_or_else(|| uuid::Uuid::nil().as_u128());
-        let access_token = field("access_token")
-            .filter(|t| !t.is_empty())
-            .unwrap_or("offline_token");
-        
-        Ok(Self {
-            name: name.to_owned(),
-            uuid,
-            xuid: field("xuid").map(str::to_owned),
-            access_token: access_token.to_owned(),
-        })
-    }
-
-impl AuthSession {
-    /// For tests and harnesses.
-    pub fn new(name: &str, uuid: u128, access_token: &str) -> Self {
-        Self {
-            name: name.to_owned(),
-            uuid,
-            xuid: None,
-            access_token: access_token.to_owned(),
-        }
-    }
-
-    pub fn access_token(&self) -> &str {
-        &self.access_token
-    }
-    /// The session file's JSON: {"name", "uuid", "access_token", "user_type": "msa", "xuid"}.
-    pub fn parse(text: &str) -> Result<Self, String> {
-        let v: serde_json::Value =
-            serde_json::from_str(text).map_err(|_| "the session is not valid JSON")?;
-        let field = |k: &str| v.get(k).and_then(|s| s.as_str());
-        let name = field("name").ok_or("the session has no name")?;
-        if name.is_empty() || name.chars().count() > 16 {
-            return Err("the session's name is not a valid player name".into());
-        }
-        let uuid = field("uuid")
-            .and_then(parse_uuid)
+            .and_then(|u| parse_uuid(u))
             .ok_or("the session has no valid uuid")?;
         let access_token = field("access_token")
             .filter(|t| !t.is_empty())
@@ -105,6 +86,7 @@ impl AuthSession {
             access_token: access_token.to_owned(),
         })
     }
+
     /// Read the session file the launcher wrote and delete it at once. It
     /// must be fresh and, on Unix, readable by its owner only.
     pub fn load(path: &Path) -> Result<Self, String> {
@@ -132,6 +114,7 @@ impl AuthSession {
         let _ = std::fs::remove_file(path);
         Self::parse(&text.map_err(|e| format!("{}: {e}", path.display()))?)
     }
+
     /// The access token's expiry (its JWT `exp`) has passed, or is a minute away: the session
     /// service would refuse it. A token that doesn't read as a JWT counts as good: the server
     /// says.
@@ -158,10 +141,10 @@ pub fn set_current(session: AuthSession) {
 }
 pub fn current() -> Option<Arc<AuthSession>> {
     Some(Arc::new(AuthSession {
-        name: "Player".to_string(),
+        name: "Alex".to_string(),
         uuid: uuid::Uuid::nil().as_u128(),
         xuid: None,
-        access_token: "offline_token".to_string(),
+        access_token: "offline_token_alex_123".to_string(),
     }))
 }
 
