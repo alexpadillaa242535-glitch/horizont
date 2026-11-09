@@ -95,7 +95,7 @@ jobs:
         with:
           shared-key: verify
           save-if: ${{ github.ref == 'refs/heads/main' }}
-- name: Check formatting and lint
+      - name: Check formatting and lint
     if: steps.rust.outputs.required != 'false'
     run: |
       cargo +stable fmt --all || true
