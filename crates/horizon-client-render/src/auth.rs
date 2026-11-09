@@ -485,3 +485,158 @@ static CHAT_KEYS: std::sync::LazyLock<Mutex<std::collections::HashMap<u128, Chat
 pub fn prepare_chat_keys(now: bool) {
     let Some(session) = current() else {
         return;
+    };
+    prepare_chat_keys_for(session, now);
+}
+
+/// Prepare keys for this player, independently of the other local accounts.
+pub fn prepare_chat_keys_for(session: Arc<AuthSession>, now: bool) {
+    let uuid = session.uuid;
+    let mut accounts = CHAT_KEYS.lock().unwrap();
+    let keys = accounts.entry(uuid).or_default();
+    let instant = std::time::Instant::now();
+    if keys.fetching || !now && keys.next_try.is_some_and(|t| instant < t) {
+        return;
+    }
+    keys.next_try = Some(instant + KEY_RETRY);
+    if keys
+        .current
+        .as_ref()
+        .is_some_and(|k| !k.due_refresh(now_millis()))
+    {
+        return;
+    }
+    keys.fetching = true;
+    drop(accounts);
+    let spawned = std::thread::Builder::new()
+        .name("Profile key fetch".into())
+        .spawn(move || {
+            let result = fetch_chat_keys(&session);
+            let mut accounts = CHAT_KEYS.lock().unwrap();
+            let keys = accounts.entry(uuid).or_default();
+            keys.fetching = false;
+            match result {
+                Ok(pair) => keys.current = Some(Arc::new(pair)),
+                Err(e) => log::error!("Failed to retrieve profile key pair: {e:?}"),
+            }
+        });
+    if spawned.is_err() {
+        CHAT_KEYS.lock().unwrap().entry(uuid).or_default().fetching = false;
+    }
+}
+
+/// The chat key pair fetched so far, unless it has expired.
+pub fn chat_keys() -> Option<Arc<ChatKeyPair>> {
+    chat_keys_for(current()?.uuid)
+}
+
+/// This account's key pair; another local player's keys can never be returned.
+pub fn chat_keys_for(uuid: u128) -> Option<Arc<ChatKeyPair>> {
+    CHAT_KEYS
+        .lock()
+        .unwrap()
+        .get(&uuid)?
+        .current
+        .clone()
+        .filter(|k| !k.public.has_expired(now_millis()))
+}
+
+const MINECRAFT_PROFILE: &str = "https://api.minecraftservices.com/minecraft/profile";
+
+/// The signed-in account's active skin and cape from `GET /minecraft/profile`.
+/// Single-player and integrated servers often send no `textures` property, or
+/// one without the equipped cape; the client asks the profile endpoint once.
+pub fn own_textures(session: &AuthSession) -> Option<crate::skins::Textures> {
+    let response = agent()
+        .get(MINECRAFT_PROFILE)
+        .set("Authorization", &format!("Bearer {}", session.access_token))
+        .call()
+        .ok()?;
+    if response.status() != 200 {
+        return None;
+    }
+    let body = response.into_string().ok()?;
+    let profile: serde_json::Value = serde_json::from_str(&body).ok()?;
+    Some(crate::skins::services_profile_textures(&profile))
+}
+
+/// What the session service says about a player joining this server
+/// (MinecraftServicesSessionService.hasJoinedServer).
+#[derive(Clone, Debug, PartialEq)]
+pub struct JoinedProfile {
+    pub uuid: u128,
+    pub properties: Vec<horizon_protocol::packets::login::Property>,
+}
+
+/// HttpDiscoveryService.buildQuery: `URLEncoder.encode(value, UTF-8)`.
+fn url_encode(text: &str) -> String {
+    let mut out = String::new();
+    for b in text.bytes() {
+        match b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'-' | b'*' | b'_' => {
+                out.push(char::from(b));
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// The session service's verify endpoint, asked by an online-mode server
+/// whether `name` joined with `server_hash` (and from `ip`, when the server
+/// prevents proxy connections). `Ok(None)`: it didn't, or the service said
+/// no; `Err(Unavailable)`: no answer.
+pub fn has_joined(
+    name: &str,
+    server_hash: &str,
+    ip: Option<std::net::IpAddr>,
+) -> Result<Option<JoinedProfile>, JoinError> {
+    let doc = discovery()?;
+    let url = endpoint(&doc, "session", "verify").ok_or(JoinError::Unavailable)?;
+    let mut query = format!(
+        "username={}&serverId={}",
+        url_encode(name),
+        url_encode(server_hash)
+    );
+    if let Some(ip) = ip {
+        query.push_str(&format!("&ip={}", url_encode(&ip.to_string())));
+    }
+    let separator = if url.contains('?') { '&' } else { '?' };
+    let body = match agent().get(&format!("{url}{separator}{query}")).call() {
+        Ok(response) => response.into_string().unwrap_or_default(),
+        Err(ureq::Error::Status(status, response)) => {
+            let error =
+                JoinError::from_response(status, &response.into_string().unwrap_or_default());
+            return match error {
+                JoinError::Unavailable => Err(error),
+                _ => Ok(None),
+            };
+        }
+        Err(ureq::Error::Transport(_)) => return Err(JoinError::Unavailable),
+    };
+    Ok(parse_joined(&body))
+}
+
+/// HasJoinedMinecraftServerResponse: `id` and `properties`; no id is no profile.
+pub fn parse_joined(body: &str) -> Option<JoinedProfile> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let uuid = parse_uuid(v.get("id")?.as_str()?)?;
+    let properties = v
+        .get("properties")
+        .and_then(|p| p.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|p| {
+            Some(horizon_protocol::packets::login::Property {
+                name: p.get("name")?.as_str()?.to_owned(),
+                value: p.get("value")?.as_str()?.to_owned(),
+                signature: p
+                    .get("signature")
+                    .and_then(|s| s.as_str())
+                    .map(str::to_owned),
+            })
+        })
+        .collect();
+    Some(JoinedProfile { uuid, properties })
+}
